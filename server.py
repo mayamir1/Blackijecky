@@ -22,7 +22,7 @@ def recv_exact(conn: socket.socket, n: int) -> bytes:
     while len(data) < n:
         chunk = conn.recv(n - len(data))
         if not chunk:
-            raise ConnectionError("Connection closed")
+            raise ConnectionError("Connection closed by peer")
         data += chunk
     return data
 
@@ -32,14 +32,17 @@ def safe_print(*args):
 
 
 class BlackjackServer:
-    def __init__(self, server_name: str = "Blackijecky-Server"):
+    def __init__(self, server_name: str = "Blackijecky-Server", max_clients: int = 10):
         self.server_name = server_name
         self._stop = threading.Event()
 
-        # TCP socket: bind to any free port (no fixed port required)
+        # Limit concurrent clients (prevents thread explosion / DoS)
+        self.client_slots = threading.Semaphore(max_clients)
+
+        # TCP socket: bind to any free port
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.tcp_sock.bind(("", 0))
+        self.tcp_sock.bind(("", 0))  # 0.0.0.0:any
         self.tcp_sock.listen(20)
         self.tcp_port = self.tcp_sock.getsockname()[1]
 
@@ -50,10 +53,8 @@ class BlackjackServer:
     def start(self):
         safe_print(f"Server started, listening on TCP port {self.tcp_port}")
 
-        t1 = threading.Thread(target=self._offer_loop, daemon=True)
-        t2 = threading.Thread(target=self._accept_loop, daemon=True)
-        t1.start()
-        t2.start()
+        threading.Thread(target=self._offer_loop, daemon=True).start()
+        threading.Thread(target=self._accept_loop, daemon=True).start()
 
         try:
             while True:
@@ -72,12 +73,24 @@ class BlackjackServer:
 
     def _offer_loop(self):
         offer = pack_offer(self.tcp_port, self.server_name)
+
+        # Broadcast targets (more robust than one address)
+        targets = [("255.255.255.255", UDP_OFFER_PORT)]
+        try:
+            local_ip = socket.gethostbyname(socket.gethostname())
+            if local_ip and local_ip.count(".") == 3:
+                parts = local_ip.split(".")
+                parts[-1] = "255"
+                targets.append((".".join(parts), UDP_OFFER_PORT))
+        except Exception:
+            pass
+
         while not self._stop.is_set():
-            try:
-                # broadcast
-                self.udp_sock.sendto(offer, ("255.255.255.255", UDP_OFFER_PORT))
-            except Exception:
-                pass
+            for target in targets:
+                try:
+                    self.udp_sock.sendto(offer, target)
+                except Exception:
+                    pass
             time.sleep(1)
 
     def _accept_loop(self):
@@ -86,30 +99,58 @@ class BlackjackServer:
                 conn, addr = self.tcp_sock.accept()
             except OSError:
                 break
-            threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+
+            # If pool full -> reject immediately (no redirect in protocol)
+            if not self.client_slots.acquire(blocking=False):
+                safe_print(f"Rejecting {addr}: server busy")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+
+            threading.Thread(target=self._handle_client_wrap, args=(conn, addr), daemon=True).start()
+
+    def _handle_client_wrap(self, conn: socket.socket, addr):
+        try:
+            self._handle_client(conn, addr)
+        finally:
+            self.client_slots.release()
+
+    def _sanitize_team_name(self, name: str) -> str:
+        name = "".join(ch if ch.isprintable() else "?" for ch in (name or ""))
+        name = name.strip()
+        if not name:
+            name = "UnknownTeam"
+        return name[:32]
 
     def _handle_client(self, conn: socket.socket, addr):
-        conn.settimeout(300)
         safe_print(f"Client connected from {addr}")
 
         try:
-            # Request is 38 bytes. Some clients might also send '\n' after it.
+            # Request phase timeout (protects against slowloris)
+            conn.settimeout(20)
+
             req = recv_exact(conn, 38)
             num_rounds, team_name = unpack_request(req)
+            team_name = self._sanitize_team_name(team_name)
 
-            # swallow optional newline if exists (non-blocking-ish)
+            if not (1 <= num_rounds <= 255):
+                raise ValueError(f"Invalid rounds: {num_rounds}")
+
+            # Swallow optional newline if exists
             try:
                 conn.settimeout(0.2)
-                extra = conn.recv(1)
-                _ = extra  # ignore
+                _ = conn.recv(1)
             except Exception:
                 pass
-            finally:
-                conn.settimeout(20)
 
             safe_print(f"Request from team '{team_name}' rounds={num_rounds}")
 
             wins = losses = ties = 0
+
+            # Gameplay: timeout for "silent client" decisions (not too short)
+            conn.settimeout(300)
 
             for r in range(1, num_rounds + 1):
                 safe_print(f"[{team_name}] Round {r}/{num_rounds} starting")
@@ -124,6 +165,10 @@ class BlackjackServer:
 
                 safe_print(f"[{team_name}] Stats: W={wins} L={losses} T={ties}")
 
+        except (socket.timeout,) as e:
+            safe_print(f"Client {addr} timeout: {e}")
+        except (ConnectionError, ConnectionResetError, BrokenPipeError, OSError) as e:
+            safe_print(f"Client {addr} disconnected unexpectedly: {e}")
         except Exception as e:
             safe_print(f"Client {addr} error: {e}")
         finally:
@@ -138,14 +183,27 @@ class BlackjackServer:
         msg = pack_payload_server(result, rank, suit)
         conn.sendall(msg)
 
+    def _read_decision(self, conn: socket.socket, team_name: str) -> str:
+        # Decision payload must be exactly 10 bytes
+        decision_msg = recv_exact(conn, 10)
+        try:
+            decision = unpack_payload_client(decision_msg)
+        except Exception:
+            raise ValueError("Invalid decision payload from client")
+
+        # Strict validation
+        if decision not in ("Hittt", "Stand"):
+            raise ValueError(f"Invalid decision value from client: {decision}")
+
+        safe_print(f"[{team_name}] Decision: {decision}")
+        return decision
+
     def _play_round(self, conn: socket.socket, team_name: str) -> int:
-        conn.settimeout(300)
         deck = Deck()
         player = Hand()
         dealer = Hand()
 
-        # Initial deal:
-        # We send payloads for: player card1, player card2, dealer upcard
+        # Initial deal
         p1 = deck.draw()
         p2 = deck.draw()
         d1 = deck.draw()
@@ -165,11 +223,7 @@ class BlackjackServer:
 
         # Player turn
         while True:
-            # read decision payload (10 bytes)
-            decision_msg = recv_exact(conn, 10)
-            decision = unpack_payload_client(decision_msg)
-            safe_print(f"[{team_name}] Decision: {decision}")
-
+            decision = self._read_decision(conn, team_name)
             if decision == "Stand":
                 break
 
@@ -177,18 +231,21 @@ class BlackjackServer:
             new_card = deck.draw()
             player.add(new_card)
 
-            # if bust -> send the busting card with LOSS
             if player.bust():
                 self._send_card(conn, RESULT_LOSS, new_card)
-                safe_print(f"[{team_name}] Player HIT -> {rank_to_str(new_card[0])} of {SUITS[new_card[1]]} BUST (total={player.total()})")
+                safe_print(
+                    f"[{team_name}] Player HIT -> {rank_to_str(new_card[0])} of {SUITS[new_card[1]]} "
+                    f"BUST (total={player.total()})"
+                )
                 return RESULT_LOSS
 
-            # else round not over -> send card with NOT_OVER
             self._send_card(conn, RESULT_NOT_OVER, new_card)
-            safe_print(f"[{team_name}] Player HIT -> {rank_to_str(new_card[0])} of {SUITS[new_card[1]]} (total={player.total()})")
+            safe_print(
+                f"[{team_name}] Player HIT -> {rank_to_str(new_card[0])} of {SUITS[new_card[1]]} "
+                f"(total={player.total()})"
+            )
 
-        # Dealer turn (player didn't bust)
-        # Reveal hidden dealer card
+        # Dealer turn
         self._send_card(conn, RESULT_NOT_OVER, d2)
         safe_print(f"[{team_name}] Dealer reveals: {rank_to_str(d2[0])} of {SUITS[d2[1]]} (total={dealer.total()})")
 
@@ -200,14 +257,14 @@ class BlackjackServer:
             last_dealer_card = c
 
             if dealer.bust():
-                self._send_card(conn, RESULT_WIN, c)  # dealer bust card => client wins
+                self._send_card(conn, RESULT_WIN, c)
                 safe_print(f"[{team_name}] Dealer draws {rank_to_str(c[0])} of {SUITS[c[1]]} -> BUST (total={dealer.total()})")
                 return RESULT_WIN
 
             self._send_card(conn, RESULT_NOT_OVER, c)
             safe_print(f"[{team_name}] Dealer draws {rank_to_str(c[0])} of {SUITS[c[1]]} (total={dealer.total()})")
 
-        # Decide winner (dealer stands)
+        # Decide winner
         p_total = player.total()
         d_total = dealer.total()
 
@@ -218,11 +275,10 @@ class BlackjackServer:
         else:
             final = RESULT_TIE
 
-        # Send final result as a payload (reusing last dealer card)
         self._send_card(conn, final, last_dealer_card)
         safe_print(f"[{team_name}] Final: player={p_total} dealer={d_total} -> result={final}")
         return final
 
 
 if __name__ == "__main__":
-    BlackjackServer(server_name="Blackijecky").start()
+    BlackjackServer(server_name="Blackijecky", max_clients=10).start()
