@@ -1,7 +1,7 @@
 # client.py
 import socket
 import time
-
+# Import protocol constants and helpers
 from protocol import (
     UDP_OFFER_PORT,
     RESULT_LOSS,
@@ -13,10 +13,12 @@ from protocol import (
     unpack_offer,
     unpack_payload_server,
 )
+# Import card helpers for display
 from cards import SUITS, rank_to_str
 
 
 def safe_send(conn: socket.socket, data: bytes) -> bool:
+    # Safely send data to server
     try:
         conn.sendall(data)
         return True
@@ -27,8 +29,8 @@ def safe_send(conn: socket.socket, data: bytes) -> bool:
 
 def recv_exact(conn: socket.socket, n: int, timeout_sec: float = 20.0) -> bytes:
     """
-    Receive exactly n bytes or raise.
-    timeout_sec is applied only while waiting for server data (protects against 'server silent').
+    Receive exactly n bytes from the server.
+    timeout_sec protects against a silent server.
     """
     old_timeout = conn.gettimeout()
     conn.settimeout(timeout_sec)
@@ -45,6 +47,7 @@ def recv_exact(conn: socket.socket, n: int, timeout_sec: float = 20.0) -> bytes:
 
 
 def pretty_result(r: int) -> str:
+    # Convert numeric result to readable string
     if r == RESULT_WIN:
         return "WIN"
     if r == RESULT_LOSS:
@@ -55,6 +58,7 @@ def pretty_result(r: int) -> str:
 
 
 def recv_server_payload(conn: socket.socket):
+    # Receive and unpack a single server payload
     raw = recv_exact(conn, 9, timeout_sec=20.0)
     try:
         return unpack_payload_server(raw)  # validates cookie/type/structure inside protocol.py
@@ -64,8 +68,8 @@ def recv_server_payload(conn: socket.socket):
 
 def listen_for_offer(timeout_sec: int = 15):
     """
-    Connect to the first VALID offer received (like the assignment example).
-    Close the UDP socket afterwards -> ignores all further offers while connected/playing.
+    Listen for UDP offers from servers.
+    Connect to the first valid offer received.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -74,6 +78,7 @@ def listen_for_offer(timeout_sec: int = 15):
         except Exception:
             pass
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Bind to UDP offer port
         s.bind(("", UDP_OFFER_PORT))
         s.settimeout(timeout_sec)
 
@@ -91,24 +96,26 @@ def listen_for_offer(timeout_sec: int = 15):
                 print(f"Received offer from {server_ip} (server='{server_name}', tcp_port={tcp_port})", flush=True)
                 return server_ip, tcp_port, server_name
             except Exception:
-                # ignore corrupted / unrelated packets and keep waiting until timeout
+                # ignore corrupted
                 continue
     finally:
         s.close()
 
 
 def run_session(conn: socket.socket, rounds: int):
+    # Track game statistics
     wins = losses = ties = 0
 
     for r in range(1, rounds + 1):
         print(f"\n=== Round {r}/{rounds} ===", flush=True)
 
-        # Initial deal
+        # Receive initial cards
         p1 = recv_server_payload(conn)
         p2 = recv_server_payload(conn)
         d1 = recv_server_payload(conn)
 
         def show_card(tag, payload):
+            # Print card information nicely
             res, rank, suit = payload
             print(f"{tag}: {rank_to_str(rank)} of {SUITS[suit]}  (msg_result={pretty_result(res)})", flush=True)
 
@@ -116,10 +123,10 @@ def run_session(conn: socket.socket, rounds: int):
         show_card("You", p2)
         show_card("Dealer shows", d1)
 
-        # Player turn
+        #Player decision loop
         while True:
             choice = input("Hit or Stand? ").strip().lower()
-
+            # Send HIT decision
             if choice in ("hit", "h"):
                 if not safe_send(conn, pack_payload_client("Hittt")):
                     raise ConnectionError("Lost connection while sending HIT")
@@ -133,6 +140,7 @@ def run_session(conn: socket.socket, rounds: int):
                     break
 
             elif choice in ("stand", "s"):
+                # Send STAND decision
                 if not safe_send(conn, pack_payload_client("Stand")):
                     raise ConnectionError("Lost connection while sending STAND")
 
@@ -140,7 +148,7 @@ def run_session(conn: socket.socket, rounds: int):
                 res, rank, suit = recv_server_payload(conn)
                 print(f"Dealer reveals: {rank_to_str(rank)} of {SUITS[suit]}", flush=True)
 
-                # Dealer draws until final result
+                # Dealer continues drawing until round ends
                 while True:
                     res, rank, suit = recv_server_payload(conn)
                     if res == RESULT_NOT_OVER:
@@ -161,7 +169,7 @@ def run_session(conn: socket.socket, rounds: int):
                 print("Type Hit or Stand.", flush=True)
 
         print(f"Stats: W={wins} L={losses} T={ties}", flush=True)
-
+    # Session summary
     played = wins + losses + ties
     win_rate = (wins / played) if played else 0.0
     print("\n=== Session finished ===", flush=True)
@@ -170,10 +178,11 @@ def run_session(conn: socket.socket, rounds: int):
 
 
 def main():
+    # Ask for team name
     team = input("Enter your team name (Enter for default): ").strip() or "BlackijeckyTeam"
 
     while True:
-        # rounds validation
+        # Ask for number of rounds
         while True:
             try:
                 rounds = int(input("Number of rounds (1-255): ").strip())
@@ -182,7 +191,7 @@ def main():
             except Exception:
                 pass
             print("Please enter a number between 1 and 255.")
-
+        # Wait for server offer
         offer = listen_for_offer(timeout_sec=15)
         if offer is None:
             ans = input("No offers received. Retry? (y/n): ").strip().lower()
@@ -194,7 +203,7 @@ def main():
 
         server_ip, tcp_port, server_name = offer
 
-        # Connect TCP
+        # Create TCP connection
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         conn.settimeout(10)
         print(f"Connecting to {server_ip}:{tcp_port} (server='{server_name}') ...", flush=True)
@@ -209,7 +218,7 @@ def main():
                 pass
             continue
 
-        # Send request (newline optional; server tolerates it)
+        # Send request packet
         req = pack_request(rounds, team)
         if not safe_send(conn, req + b"\n"):
             try:
@@ -218,7 +227,7 @@ def main():
                 pass
             continue
 
-        # gameplay: no strict timeout for user input, but recv_exact has its own network timeout
+        # Remove timeout during gameplay
         conn.settimeout(None)
 
         try:
@@ -239,4 +248,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # Start the client
     main()
