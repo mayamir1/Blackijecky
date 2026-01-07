@@ -89,7 +89,7 @@ class BlackjackServer:
             threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
 
     def _handle_client(self, conn: socket.socket, addr):
-        conn.settimeout(20)
+        conn.settimeout(300)
         safe_print(f"Client connected from {addr}")
 
         try:
@@ -139,6 +139,7 @@ class BlackjackServer:
         conn.sendall(msg)
 
     def _play_round(self, conn: socket.socket, team_name: str) -> int:
+        conn.settimeout(300)
         deck = Deck()
         player = Hand()
         dealer = Hand()
