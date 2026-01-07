@@ -170,16 +170,18 @@ def main():
             conn.connect((server_ip, tcp_port))
         except Exception as e:
             print(f"Failed to connect: {e}", flush=True)
+            try:
+                conn.close()
+            except Exception:
+                pass
             continue
-
-        print("TCP connected.", flush=True)
 
         # No strict timeout during human gameplay
         conn.settimeout(None)
 
         # Send request
         req = pack_request(rounds, team)
-        if not safe_send(conn, req + b"\n"):
+        if not safe_send(conn, req):
             try:
                 conn.close()
             except Exception:
